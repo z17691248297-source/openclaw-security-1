@@ -1,0 +1,14 @@
+{
+  "name": "openclaw-trusted-backend-standalone",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone trusted-layer sidecar for OpenClaw paper-oriented trusted isolation.",
+  "type": "module",
+  "scripts": {
+    "dev": "node ./server.mjs",
+    "start": "node ./server.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

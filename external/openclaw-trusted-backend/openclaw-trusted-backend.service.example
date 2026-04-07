@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenClaw Trusted Backend
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=openclaw-trusted
+Group=openclaw-trusted
+WorkingDirectory=/opt/openclaw-trusted-backend
+EnvironmentFile=/etc/openclaw-trusted-backend/openclaw-trusted-backend.env
+ExecStart=/usr/bin/node /opt/openclaw-trusted-backend/server.mjs
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/openclaw-trusted-backend
+
+[Install]
+WantedBy=multi-user.target
