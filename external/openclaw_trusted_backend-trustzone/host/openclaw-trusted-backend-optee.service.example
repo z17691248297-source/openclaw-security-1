@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw trusted backend OP-TEE example
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/openclaw-trusted-backend-optee
+EnvironmentFile=/etc/openclaw-trusted-backend-optee.env
+ExecStart=/usr/bin/optee_example_openclaw_trusted_backend_server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

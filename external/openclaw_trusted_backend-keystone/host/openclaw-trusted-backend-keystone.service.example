@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw trusted backend Keystone example
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/openclaw-trusted-backend-keystone
+EnvironmentFile=/etc/openclaw-trusted-backend-keystone.env
+ExecStart=/usr/bin/keystone_example_openclaw_trusted_backend_server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
