@@ -10,7 +10,7 @@ const CANONICAL_TRUSTED_BACKEND_DIR = path.join(
   __dirname,
   "..",
   "external",
-  "openclaw-trusted-backend",
+  "openclaw-trusted-backend-tdx",
 );
 const CANONICAL_BACKEND_FILES = [
   "server.mjs",

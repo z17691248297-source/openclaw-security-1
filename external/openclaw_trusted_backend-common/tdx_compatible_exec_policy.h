@@ -143,6 +143,19 @@ struct oc_policy_exec_context {
 	bool has_session;
 };
 
+struct oc_policy_remote_dispatch_view {
+	bool present;
+	bool cross_boundary;
+	const char *remote_action;
+	const char *object_class;
+	const char *effect_class;
+	char target_label[OC_POLICY_MAX_PATH_LEN];
+	char remote_object[OC_POLICY_MAX_PATH_LEN];
+	char remote_platform[OC_POLICY_MAX_SCOPE_VALUE];
+	char remote_executor[OC_POLICY_MAX_SCOPE_VALUE];
+	char boundary[OC_POLICY_MAX_SCOPE_VALUE];
+};
+
 #ifndef OC_POLICY_ALLOC_EXEC_CONTEXT
 #define OC_POLICY_ALLOC_EXEC_CONTEXT(name)                                \
 	struct oc_policy_exec_context name##_storage;                     \
@@ -506,6 +519,212 @@ static bool oc_policy_extract_json_string(const char *json, const char *field,
 	}
 
 	return false;
+}
+
+static const char *oc_policy_remote_dispatch_action_name(const char *value)
+{
+	if (!value || !value[0])
+		return "unknown";
+	if (oc_policy_equals_ci(value, "read") ||
+	    oc_policy_equals_ci(value, "query") ||
+	    oc_policy_equals_ci(value, "observe") ||
+	    oc_policy_equals_ci(value, "inspect"))
+		return "read";
+	if (oc_policy_equals_ci(value, "exec") ||
+	    oc_policy_equals_ci(value, "command") ||
+	    oc_policy_equals_ci(value, "run"))
+		return "exec";
+	if (oc_policy_equals_ci(value, "modify") ||
+	    oc_policy_equals_ci(value, "write") ||
+	    oc_policy_equals_ci(value, "update") ||
+	    oc_policy_equals_ci(value, "create"))
+		return "modify";
+	if (oc_policy_equals_ci(value, "delete") ||
+	    oc_policy_equals_ci(value, "remove"))
+		return "delete";
+	if (oc_policy_equals_ci(value, "export") ||
+	    oc_policy_equals_ci(value, "transfer") ||
+	    oc_policy_equals_ci(value, "archive"))
+		return "export";
+	return value;
+}
+
+static const char *oc_policy_remote_dispatch_object_class_name(const char *value)
+{
+	if (!value || !value[0])
+		return "ordinary";
+	if (oc_policy_equals_ci(value, "critical") ||
+	    oc_policy_equals_ci(value, "protected"))
+		return "critical";
+	if (oc_policy_equals_ci(value, "sensitive") ||
+	    oc_policy_equals_ci(value, "restricted"))
+		return "sensitive";
+	return "ordinary";
+}
+
+static const char *oc_policy_remote_dispatch_effect_name(const char *value,
+						 const char *fallback_action)
+{
+	if (!value || !value[0]) {
+		if (fallback_action &&
+		    (oc_policy_equals_ci(fallback_action, "read") ||
+		     oc_policy_equals_ci(fallback_action, "exec")))
+			return "observe";
+		if (fallback_action &&
+		    oc_policy_equals_ci(fallback_action, "export"))
+			return "export";
+		if (fallback_action &&
+		    (oc_policy_equals_ci(fallback_action, "modify") ||
+		     oc_policy_equals_ci(fallback_action, "delete")))
+			return "state-mutation";
+		return "unknown";
+	}
+	if (oc_policy_equals_ci(value, "observe") ||
+	    oc_policy_equals_ci(value, "observation") ||
+	    oc_policy_equals_ci(value, "query") ||
+	    oc_policy_equals_ci(value, "read-only") ||
+	    oc_policy_equals_ci(value, "transient"))
+		return "observe";
+	if (oc_policy_equals_ci(value, "modify") ||
+	    oc_policy_equals_ci(value, "state-mutation") ||
+	    oc_policy_equals_ci(value, "mutation") ||
+	    oc_policy_equals_ci(value, "persistence"))
+		return "state-mutation";
+	if (oc_policy_equals_ci(value, "privilege") ||
+	    oc_policy_equals_ci(value, "privilege-mutation") ||
+	    oc_policy_equals_ci(value, "system-state"))
+		return "privilege-mutation";
+	if (oc_policy_equals_ci(value, "export") ||
+	    oc_policy_equals_ci(value, "transfer") ||
+	    oc_policy_equals_ci(value, "exfiltration"))
+		return "export";
+	if (oc_policy_equals_ci(value, "archive") ||
+	    oc_policy_equals_ci(value, "packaging") ||
+	    oc_policy_equals_ci(value, "bundle"))
+		return "archive";
+	if (oc_policy_equals_ci(value, "destructive") ||
+	    oc_policy_equals_ci(value, "delete") ||
+	    oc_policy_equals_ci(value, "removal"))
+		return "destructive";
+	return value;
+}
+
+static bool oc_policy_parse_structured_remote_dispatch(
+	const struct oc_policy_request_view *request,
+	struct oc_policy_remote_dispatch_view *dispatch)
+{
+	char dispatch_kind[OC_POLICY_MAX_SCOPE_VALUE];
+	char action_value[OC_POLICY_MAX_SCOPE_VALUE];
+	char object_class_value[OC_POLICY_MAX_SCOPE_VALUE];
+	char effect_value[OC_POLICY_MAX_SCOPE_VALUE];
+
+	memset(dispatch, 0, sizeof(*dispatch));
+	memset(dispatch_kind, 0, sizeof(dispatch_kind));
+	memset(action_value, 0, sizeof(action_value));
+	memset(object_class_value, 0, sizeof(object_class_value));
+	memset(effect_value, 0, sizeof(effect_value));
+
+	if (!request || !request->scope_raw || !request->scope_raw[0])
+		return false;
+
+	oc_policy_extract_json_string(request->scope_raw, "dispatchKind",
+				      dispatch_kind,
+				      sizeof(dispatch_kind));
+	oc_policy_extract_json_string(request->scope_raw, "remoteAction",
+				      action_value, sizeof(action_value));
+	if (!action_value[0])
+		oc_policy_extract_json_string(request->scope_raw, "operationKind",
+					      action_value,
+					      sizeof(action_value));
+	oc_policy_extract_json_string(request->scope_raw, "remoteObjectClass",
+				      object_class_value,
+				      sizeof(object_class_value));
+	if (!object_class_value[0])
+		oc_policy_extract_json_string(request->scope_raw, "objectClass",
+					      object_class_value,
+					      sizeof(object_class_value));
+	oc_policy_extract_json_string(request->scope_raw, "remoteEffect",
+				      effect_value, sizeof(effect_value));
+	if (!effect_value[0])
+		oc_policy_extract_json_string(request->scope_raw, "effectClass",
+					      effect_value,
+					      sizeof(effect_value));
+
+	if (dispatch_kind[0] && !oc_policy_equals_ci(dispatch_kind, "remote"))
+		return false;
+
+	dispatch->remote_action =
+		oc_policy_remote_dispatch_action_name(action_value);
+	if (!dispatch_kind[0] &&
+	    oc_policy_equals_ci(dispatch->remote_action, "unknown"))
+		return false;
+
+	dispatch->object_class =
+		oc_policy_remote_dispatch_object_class_name(object_class_value);
+	dispatch->effect_class =
+		oc_policy_remote_dispatch_effect_name(effect_value,
+						      dispatch->remote_action);
+	oc_policy_extract_json_string(request->scope_raw, "remotePlatform",
+				      dispatch->remote_platform,
+				      sizeof(dispatch->remote_platform));
+	if (!dispatch->remote_platform[0])
+		oc_policy_extract_json_string(request->scope_raw, "platform",
+					      dispatch->remote_platform,
+					      sizeof(dispatch->remote_platform));
+	if (!dispatch->remote_platform[0])
+		oc_policy_copy_text(dispatch->remote_platform,
+				    sizeof(dispatch->remote_platform),
+				    "remote");
+	oc_policy_extract_json_string(request->scope_raw, "remoteExecutor",
+				      dispatch->remote_executor,
+				      sizeof(dispatch->remote_executor));
+	if (!dispatch->remote_executor[0])
+		oc_policy_extract_json_string(request->scope_raw, "executor",
+					      dispatch->remote_executor,
+					      sizeof(dispatch->remote_executor));
+	if (!dispatch->remote_executor[0])
+		oc_policy_copy_text(dispatch->remote_executor,
+				    sizeof(dispatch->remote_executor),
+				    "ree-proxy");
+	oc_policy_extract_json_string(request->scope_raw, "boundary",
+				      dispatch->boundary,
+				      sizeof(dispatch->boundary));
+	if (!dispatch->boundary[0])
+		oc_policy_extract_json_string(request->scope_raw,
+					      "dispatchBoundary",
+					      dispatch->boundary,
+					      sizeof(dispatch->boundary));
+	if (!dispatch->boundary[0])
+		oc_policy_copy_text(dispatch->boundary,
+				    sizeof(dispatch->boundary),
+				    "cross-boundary");
+	dispatch->cross_boundary =
+		oc_policy_contains_ci(dispatch->boundary, "cross");
+	oc_policy_extract_json_string(request->scope_raw, "targetLabel",
+				      dispatch->target_label,
+				      sizeof(dispatch->target_label));
+	oc_policy_extract_json_string(request->scope_raw, "remoteObject",
+				      dispatch->remote_object,
+				      sizeof(dispatch->remote_object));
+	if (!dispatch->target_label[0] && dispatch->remote_object[0])
+		oc_policy_copy_text(dispatch->target_label,
+				    sizeof(dispatch->target_label),
+				    dispatch->remote_object);
+	if (!dispatch->target_label[0] && request->object && request->object[0])
+		oc_policy_copy_text(dispatch->target_label,
+				    sizeof(dispatch->target_label),
+				    request->object);
+	if (!dispatch->target_label[0])
+		oc_policy_copy_text(dispatch->target_label,
+				    sizeof(dispatch->target_label),
+				    "remote-target");
+	if (!dispatch->remote_object[0])
+		oc_policy_copy_text(dispatch->remote_object,
+				    sizeof(dispatch->remote_object),
+				    dispatch->target_label);
+
+	dispatch->present = true;
+	return true;
 }
 
 static bool oc_policy_is_url(const char *value)
@@ -1627,6 +1846,255 @@ static const char *oc_policy_execution_mode_for_decision(const char *decision)
 	return "ree-constrained";
 }
 
+static bool oc_policy_try_evaluate_structured_remote_dispatch(
+	const struct oc_policy_request_view *request,
+	struct oc_policy_result *result)
+{
+	struct oc_policy_remote_dispatch_view dispatch;
+	struct oc_policy_action_assessment action_risk;
+	struct oc_policy_object_assessment object_risk;
+	struct oc_policy_context_assessment context_risk;
+	struct oc_policy_effect_assessment effect_risk;
+	enum oc_policy_risk_level final_level = OC_POLICY_RISK_L0;
+	bool deny_by_object = false;
+	bool deny_by_action = false;
+	bool deny_by_effect = false;
+	bool allow_observe = false;
+	const char *final_decision = "ddeny";
+	const char *final_reason =
+		"unclassified cross-boundary remote dispatch is denied locally";
+	const char *matched_rule_id =
+		"remote.dispatch.local-deny.unclassified";
+	const char *execution_mode = "isolated";
+
+	if (!oc_policy_parse_structured_remote_dispatch(request, &dispatch))
+		return false;
+
+	memset(result, 0, sizeof(*result));
+	memset(&action_risk, 0, sizeof(action_risk));
+	memset(&object_risk, 0, sizeof(object_risk));
+	memset(&context_risk, 0, sizeof(context_risk));
+	memset(&effect_risk, 0, sizeof(effect_risk));
+
+	if (oc_policy_equals_ci(dispatch.remote_action, "read")) {
+		action_risk.base.level = OC_POLICY_RISK_L1;
+		action_risk.base.reason =
+			"cross-boundary remote observation request";
+		action_risk.base.matched_rule_id =
+			"remote.dispatch.action.observe";
+		action_risk.command_class = OC_POLICY_COMMAND_LOW_RISK;
+	} else if (oc_policy_equals_ci(dispatch.remote_action, "exec")) {
+		action_risk.base.level = OC_POLICY_RISK_L1;
+		action_risk.base.reason =
+			"cross-boundary remote bounded command request";
+		action_risk.base.matched_rule_id =
+			"remote.dispatch.action.exec-observe";
+		action_risk.command_class = OC_POLICY_COMMAND_LOW_RISK;
+	} else if (oc_policy_equals_ci(dispatch.remote_action, "modify")) {
+		action_risk.base.level = OC_POLICY_RISK_L3;
+		action_risk.base.reason =
+			"cross-boundary remote state mutation request";
+		action_risk.base.matched_rule_id =
+			"remote.dispatch.action.modify";
+		action_risk.command_class = OC_POLICY_COMMAND_HIGH_RISK;
+	} else if (oc_policy_equals_ci(dispatch.remote_action, "delete")) {
+		action_risk.base.level = OC_POLICY_RISK_L3;
+		action_risk.base.reason =
+			"cross-boundary remote destructive request";
+		action_risk.base.matched_rule_id =
+			"remote.dispatch.action.delete";
+		action_risk.command_class = OC_POLICY_COMMAND_HIGH_RISK;
+	} else if (oc_policy_equals_ci(dispatch.remote_action, "export")) {
+		action_risk.base.level = OC_POLICY_RISK_L3;
+		action_risk.base.reason =
+			"cross-boundary remote export request";
+		action_risk.base.matched_rule_id =
+			"remote.dispatch.action.export";
+		action_risk.command_class = OC_POLICY_COMMAND_HIGH_RISK;
+	} else {
+		action_risk.base.level = OC_POLICY_RISK_L2;
+		action_risk.base.reason =
+			"unclassified cross-boundary remote request";
+		action_risk.base.matched_rule_id =
+			"remote.dispatch.action.unknown";
+		action_risk.command_class = OC_POLICY_COMMAND_UNKNOWN;
+	}
+
+	if (oc_policy_equals_ci(dispatch.object_class, "critical")) {
+		object_risk.base.level = OC_POLICY_RISK_L3;
+		object_risk.base.reason = "critical remote target";
+		object_risk.base.matched_rule_id =
+			"remote.dispatch.object.critical";
+		object_risk.classification = OC_POLICY_OBJECT_CRITICAL;
+	} else if (oc_policy_equals_ci(dispatch.object_class, "sensitive")) {
+		object_risk.base.level = OC_POLICY_RISK_L2;
+		object_risk.base.reason = "sensitive remote target";
+		object_risk.base.matched_rule_id =
+			"remote.dispatch.object.sensitive";
+		object_risk.classification = OC_POLICY_OBJECT_SENSITIVE;
+	} else {
+		object_risk.base.level = OC_POLICY_RISK_L0;
+		object_risk.base.reason = "ordinary remote target";
+		object_risk.base.matched_rule_id =
+			"remote.dispatch.object.ordinary";
+		object_risk.classification = OC_POLICY_OBJECT_ORDINARY;
+	}
+
+	context_risk.multi_step = false;
+	context_risk.outside_workspace = false;
+	context_risk.remote_target = true;
+	context_risk.shell_wrapper = false;
+	context_risk.user_absent =
+		!((request->session_binding && request->session_binding[0]) ||
+		  (request->sid && request->sid[0] &&
+		   !oc_policy_equals_ci(request->sid, "anonymous")));
+	context_risk.target_count = 1;
+	if (dispatch.cross_boundary) {
+		context_risk.base.level = OC_POLICY_RISK_L1;
+		context_risk.base.reason =
+			"cross-boundary remote dispatch requires local trusted authorization";
+		context_risk.base.matched_rule_id =
+			"remote.dispatch.context.cross-boundary";
+	} else {
+		context_risk.base.level = OC_POLICY_RISK_L0;
+		context_risk.base.reason = "remote dispatch metadata present";
+		context_risk.base.matched_rule_id =
+			"remote.dispatch.context.local";
+	}
+
+	if (oc_policy_equals_ci(dispatch.effect_class, "state-mutation") ||
+	    oc_policy_equals_ci(dispatch.effect_class,
+				"privilege-mutation") ||
+	    oc_policy_equals_ci(dispatch.effect_class, "export") ||
+	    oc_policy_equals_ci(dispatch.effect_class, "archive") ||
+	    oc_policy_equals_ci(dispatch.effect_class, "destructive")) {
+		effect_risk.base.level = OC_POLICY_RISK_L3;
+		if (oc_policy_equals_ci(dispatch.effect_class, "export") ||
+		    oc_policy_equals_ci(dispatch.effect_class, "archive")) {
+			effect_risk.base.reason =
+				"cross-boundary remote export effect";
+			effect_risk.base.matched_rule_id =
+				"remote.dispatch.effect.export";
+			effect_risk.export_like = true;
+			effect_risk.privilege_mutation = false;
+			effect_risk.destructive = false;
+			effect_risk.persistence = false;
+		} else if (oc_policy_equals_ci(dispatch.effect_class,
+					       "privilege-mutation")) {
+			effect_risk.base.reason =
+				"cross-boundary remote privileged mutation effect";
+			effect_risk.base.matched_rule_id =
+				"remote.dispatch.effect.privilege-mutation";
+			effect_risk.privilege_mutation = true;
+			effect_risk.export_like = false;
+			effect_risk.destructive = false;
+			effect_risk.persistence = false;
+		} else if (oc_policy_equals_ci(dispatch.effect_class,
+					       "destructive")) {
+			effect_risk.base.reason =
+				"cross-boundary remote destructive effect";
+			effect_risk.base.matched_rule_id =
+				"remote.dispatch.effect.destructive";
+			effect_risk.destructive = true;
+			effect_risk.export_like = false;
+			effect_risk.privilege_mutation = false;
+			effect_risk.persistence = false;
+		} else {
+			effect_risk.base.reason =
+				"cross-boundary remote state mutation effect";
+			effect_risk.base.matched_rule_id =
+				"remote.dispatch.effect.modify";
+			effect_risk.persistence = true;
+			effect_risk.export_like = false;
+			effect_risk.privilege_mutation = false;
+			effect_risk.destructive = false;
+		}
+	} else if (oc_policy_equals_ci(dispatch.effect_class, "observe")) {
+		effect_risk.base.level = OC_POLICY_RISK_L1;
+		effect_risk.base.reason = "bounded remote observation effect";
+		effect_risk.base.matched_rule_id =
+			"remote.dispatch.effect.observe";
+	} else {
+		effect_risk.base.level = OC_POLICY_RISK_L2;
+		effect_risk.base.reason =
+			"unclassified remote execution effect";
+		effect_risk.base.matched_rule_id =
+			"remote.dispatch.effect.unknown";
+	}
+
+	final_level = oc_policy_max_level(action_risk.base.level,
+					      object_risk.base.level);
+	final_level = oc_policy_max_level(final_level, context_risk.base.level);
+	final_level = oc_policy_max_level(final_level, effect_risk.base.level);
+
+	deny_by_object =
+		object_risk.classification != OC_POLICY_OBJECT_ORDINARY;
+	deny_by_action =
+		oc_policy_equals_ci(dispatch.remote_action, "modify") ||
+		oc_policy_equals_ci(dispatch.remote_action, "delete") ||
+		oc_policy_equals_ci(dispatch.remote_action, "export");
+	deny_by_effect =
+		oc_policy_equals_ci(dispatch.effect_class, "state-mutation") ||
+		oc_policy_equals_ci(dispatch.effect_class,
+				    "privilege-mutation") ||
+		oc_policy_equals_ci(dispatch.effect_class, "export") ||
+		oc_policy_equals_ci(dispatch.effect_class, "archive") ||
+		oc_policy_equals_ci(dispatch.effect_class, "destructive");
+	allow_observe =
+		dispatch.cross_boundary && !deny_by_object && !deny_by_action &&
+		!deny_by_effect &&
+		(oc_policy_equals_ci(dispatch.remote_action, "read") ||
+		 oc_policy_equals_ci(dispatch.remote_action, "exec")) &&
+		oc_policy_equals_ci(dispatch.effect_class, "observe");
+
+	if (allow_observe) {
+		final_decision = "dia";
+		final_reason =
+			"cross-boundary ordinary observation dispatch authorized locally";
+		matched_rule_id = "remote.dispatch.local-allow.observe";
+		execution_mode = "ree-constrained";
+	} else if (deny_by_object) {
+		final_reason =
+			"remote protected or sensitive target is denied by local dispatch policy";
+		matched_rule_id =
+			"remote.dispatch.local-deny.protected-object";
+	} else if (deny_by_action || deny_by_effect) {
+		final_reason =
+			"cross-boundary remote state mutation or export is denied locally";
+		matched_rule_id =
+			"remote.dispatch.local-deny.cross-boundary-mutation";
+	} else {
+		final_reason =
+			"unclassified cross-boundary remote dispatch is denied locally";
+		matched_rule_id =
+			"remote.dispatch.local-deny.unclassified";
+	}
+
+	result->allow = allow_observe;
+	result->requires_confirmation = false;
+	result->nonce_bound =
+		allow_observe && request->action &&
+		oc_policy_equals_ci(request->action, "exec");
+	result->decision = final_decision;
+	result->level = oc_policy_level_name(final_level);
+	result->execution_mode = execution_mode;
+	result->reason = final_reason;
+	result->matched_rule_id = matched_rule_id;
+	result->action_risk_level =
+		oc_policy_level_name(action_risk.base.level);
+	result->action_risk_reason = action_risk.base.reason;
+	result->object_risk_level =
+		oc_policy_level_name(object_risk.base.level);
+	result->object_risk_reason = object_risk.base.reason;
+	result->context_risk_level =
+		oc_policy_level_name(context_risk.base.level);
+	result->context_risk_reason = context_risk.base.reason;
+	result->effect_risk_level =
+		oc_policy_level_name(effect_risk.base.level);
+	result->effect_risk_reason = effect_risk.base.reason;
+	return true;
+}
+
 static void oc_tdx_policy_evaluate(const struct oc_policy_request_view *request,
 				       struct oc_policy_result *result)
 {
@@ -1645,6 +2113,8 @@ static void oc_tdx_policy_evaluate(const struct oc_policy_request_view *request,
 	const char *execution_mode = "ree-direct";
 
 	memset(result, 0, sizeof(*result));
+	if (oc_policy_try_evaluate_structured_remote_dispatch(request, result))
+		return;
 	if (!context) {
 		result->decision = "ddeny";
 		result->level = "L3";

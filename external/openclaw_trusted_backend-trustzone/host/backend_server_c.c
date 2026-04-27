@@ -39,10 +39,15 @@
 #define MAX_VERIFY_MODE 32
 #define MAX_HMAC_KEY 256
 #define MAX_PRIVATE_KEY_FILE 512
+#define MAX_PUBLIC_KEY_FILE 512
 #define MAX_SCOPE_JSON 4096
 #define MAX_JSON_TOKEN 1024
 #define MAX_REQUEST_JSON 16384
 #define MAX_PENDING_CONFIRMATIONS 32
+#define MAX_EXEC_ARGS 32
+#define MAX_EXEC_ARG_LEN 256
+#define MAX_EXEC_COMMAND 512
+#define MAX_EXEC_RAW_COMMAND 2048
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -53,6 +58,7 @@ struct server_config {
 	char verify_mode[MAX_VERIFY_MODE];
 	char hmac_key[MAX_HMAC_KEY];
 	char signing_private_key_file[MAX_PRIVATE_KEY_FILE];
+	char upstream_tdx_public_key_file[MAX_PUBLIC_KEY_FILE];
 	int scope_token_ttl_ms;
 	int confirmation_ttl_ms;
 };
@@ -84,6 +90,25 @@ struct pending_confirmation {
 struct server_state {
 	struct server_config config;
 	struct pending_confirmation pending[MAX_PENDING_CONFIRMATIONS];
+};
+
+struct exec_spec {
+	char match_mode[32];
+	char raw_command[MAX_EXEC_RAW_COMMAND];
+	char command[MAX_EXEC_COMMAND];
+	char cwd[OC_TA_MAX_OBJECT];
+	char args[MAX_EXEC_ARGS][MAX_EXEC_ARG_LEN];
+	size_t arg_count;
+};
+
+struct approved_exec_binding {
+	char raw_command[MAX_EXEC_RAW_COMMAND];
+	char command[MAX_EXEC_COMMAND];
+	char cwd[OC_TA_MAX_OBJECT];
+	char workspace_root[OC_TA_MAX_OBJECT];
+	char remote_platform[64];
+	char args[MAX_EXEC_ARGS][MAX_EXEC_ARG_LEN];
+	size_t arg_count;
 };
 
 struct http_request {
@@ -134,6 +159,11 @@ static int coerce_int(const char *raw, int fallback)
 	if (parsed < INT_MIN || parsed > INT_MAX)
 		return fallback;
 	return (int)parsed;
+}
+
+static const char *bool_json(bool value)
+{
+	return value ? "true" : "false";
 }
 
 static const char *skip_ws(const char *cursor)
@@ -261,6 +291,63 @@ static bool json_find_key(const char *json, const char *key,
 		}
 
 		cursor = key_end + 1;
+	}
+
+	return false;
+}
+
+static bool json_find_top_level_key(const char *json, const char *key,
+				    const char **value_start,
+				    const char **value_end)
+{
+	const char *cursor = NULL;
+
+	if (!json || !key || !value_start || !value_end)
+		return false;
+
+	cursor = skip_ws(json);
+	if (*cursor != '{')
+		return false;
+	cursor++;
+
+	while (*cursor) {
+		const char *key_end = NULL;
+		const char *after_key = NULL;
+		const char *value = NULL;
+		const char *end = NULL;
+
+		cursor = skip_ws(cursor);
+		if (*cursor == '}')
+			return false;
+		if (*cursor != '"')
+			return false;
+
+		key_end = json_string_end(cursor);
+		if (!key_end)
+			return false;
+
+		after_key = skip_ws(key_end + 1);
+		if (*after_key != ':')
+			return false;
+
+		value = skip_ws(after_key + 1);
+		end = json_value_end(value);
+		if (!end)
+			return false;
+
+		if (json_key_matches(cursor + 1, key_end - 1, key)) {
+			*value_start = value;
+			*value_end = end;
+			return true;
+		}
+
+		cursor = skip_ws(end + 1);
+		if (*cursor == ',') {
+			cursor++;
+			continue;
+		}
+		if (*cursor == '}')
+			return false;
 	}
 
 	return false;
@@ -403,6 +490,21 @@ static bool json_get_string(const char *json, const char *key, char *out,
 	return json_decode_string(value_start, value_end, out, out_len);
 }
 
+static bool json_get_string_top_level(const char *json, const char *key,
+				      char *out, size_t out_len)
+{
+	const char *value_start = NULL;
+	const char *value_end = NULL;
+
+	if (!json_find_top_level_key(json, key, &value_start, &value_end))
+		return false;
+	if (!value_start || !value_end || *value_start != '"' ||
+	    *value_end != '"')
+		return false;
+
+	return json_decode_string(value_start, value_end, out, out_len);
+}
+
 static bool json_get_raw_value(const char *json, const char *key, char *out,
 			       size_t out_len)
 {
@@ -422,6 +524,25 @@ static bool json_get_raw_value(const char *json, const char *key, char *out,
 	return true;
 }
 
+static bool json_get_raw_value_top_level(const char *json, const char *key,
+					 char *out, size_t out_len)
+{
+	const char *value_start = NULL;
+	const char *value_end = NULL;
+	size_t n = 0;
+
+	if (!json_find_top_level_key(json, key, &value_start, &value_end))
+		return false;
+
+	n = (size_t)(value_end - value_start + 1);
+	if (n >= out_len)
+		return false;
+
+	memcpy(out, value_start, n);
+	out[n] = '\0';
+	return true;
+}
+
 static bool json_get_bool(const char *json, const char *key, bool *out)
 {
 	const char *value_start = NULL;
@@ -429,6 +550,29 @@ static bool json_get_bool(const char *json, const char *key, bool *out)
 	size_t n = 0;
 
 	if (!out || !json_find_key(json, key, &value_start, &value_end))
+		return false;
+
+	n = (size_t)(value_end - value_start + 1);
+	if (n == 4 && strncmp(value_start, "true", 4) == 0) {
+		*out = true;
+		return true;
+	}
+	if (n == 5 && strncmp(value_start, "false", 5) == 0) {
+		*out = false;
+		return true;
+	}
+
+	return false;
+}
+
+static bool json_get_bool_top_level(const char *json, const char *key,
+				    bool *out)
+{
+	const char *value_start = NULL;
+	const char *value_end = NULL;
+	size_t n = 0;
+
+	if (!out || !json_find_top_level_key(json, key, &value_start, &value_end))
 		return false;
 
 	n = (size_t)(value_end - value_start + 1);
@@ -469,6 +613,77 @@ static bool json_get_int64(const char *json, const char *key, long long *out)
 
 	*out = parsed;
 	return true;
+}
+
+static bool json_get_int64_top_level(const char *json, const char *key,
+				     long long *out)
+{
+	const char *value_start = NULL;
+	const char *value_end = NULL;
+	char raw[32];
+	char *end = NULL;
+	long long parsed = 0;
+	size_t n = 0;
+
+	if (!out || !json_find_top_level_key(json, key, &value_start, &value_end))
+		return false;
+
+	n = (size_t)(value_end - value_start + 1);
+	if (!n || n >= sizeof(raw))
+		return false;
+
+	memcpy(raw, value_start, n);
+	raw[n] = '\0';
+
+	parsed = strtoll(raw, &end, 10);
+	if (!end || *end != '\0')
+		return false;
+
+	*out = parsed;
+	return true;
+}
+
+static bool json_parse_string_array(const char *json, char values[][MAX_EXEC_ARG_LEN],
+				    size_t max_values, size_t *out_count)
+{
+	const char *cursor = skip_ws(json);
+	size_t count = 0;
+
+	if (!cursor || !values || !out_count || *cursor != '[')
+		return false;
+
+	cursor = skip_ws(cursor + 1);
+	if (*cursor == ']') {
+		*out_count = 0;
+		return true;
+	}
+
+	while (*cursor) {
+		const char *value_end = NULL;
+
+		if (count >= max_values || *cursor != '"')
+			return false;
+
+		value_end = json_string_end(cursor);
+		if (!value_end ||
+		    !json_decode_string(cursor, value_end, values[count],
+					MAX_EXEC_ARG_LEN))
+			return false;
+		count++;
+
+		cursor = skip_ws(value_end + 1);
+		if (*cursor == ',') {
+			cursor = skip_ws(cursor + 1);
+			continue;
+		}
+		if (*cursor == ']') {
+			*out_count = count;
+			return true;
+		}
+		return false;
+	}
+
+	return false;
 }
 
 static char *json_escape_string(const char *input)
@@ -971,6 +1186,290 @@ static bool run_ca_command(char *const argv[], char **output, int *exit_code)
 	return true;
 }
 
+static bool parse_exec_spec(const struct scope_request *request,
+			    struct exec_spec *spec, char **error_json)
+{
+	char raw_args[MAX_SCOPE_JSON];
+
+	memset(spec, 0, sizeof(*spec));
+	if (!json_get_string(request->scope_raw, "rawCommand", spec->raw_command,
+			     sizeof(spec->raw_command))) {
+		*error_json = build_error_json("invalid_remote_scope",
+					      "missing exec.rawCommand");
+		return false;
+	}
+	if (!json_get_string(request->scope_raw, "matchMode", spec->match_mode,
+			     sizeof(spec->match_mode)))
+		copy_text(spec->match_mode, sizeof(spec->match_mode), "shell-exact");
+	json_get_string(request->scope_raw, "command", spec->command,
+			sizeof(spec->command));
+	json_get_string(request->scope_raw, "cwd", spec->cwd, sizeof(spec->cwd));
+
+	if (json_get_raw_value(request->scope_raw, "args", raw_args,
+			       sizeof(raw_args)) &&
+	    !json_parse_string_array(raw_args, spec->args, ARRAY_SIZE(spec->args),
+				     &spec->arg_count)) {
+		*error_json = build_error_json("invalid_remote_scope",
+					      "invalid exec.args");
+		return false;
+	}
+
+	if (strcmp(spec->match_mode, "exact") == 0 && !spec->command[0]) {
+		*error_json = build_error_json("invalid_remote_scope",
+					      "exact exec scope missing command");
+		return false;
+	}
+
+	return true;
+}
+
+static bool run_exec_spec(const struct exec_spec *spec, char **stdout_text,
+			  char **stderr_text, int *exit_code)
+{
+	int stdout_pipe[2];
+	int stderr_pipe[2];
+	pid_t pid = 0;
+	int status = 0;
+
+	*stdout_text = NULL;
+	*stderr_text = NULL;
+	*exit_code = -1;
+
+	if (pipe(stdout_pipe) < 0)
+		return false;
+	if (pipe(stderr_pipe) < 0) {
+		close(stdout_pipe[0]);
+		close(stdout_pipe[1]);
+		return false;
+	}
+
+	pid = fork();
+	if (pid < 0) {
+		close(stdout_pipe[0]);
+		close(stdout_pipe[1]);
+		close(stderr_pipe[0]);
+		close(stderr_pipe[1]);
+		return false;
+	}
+
+	if (!pid) {
+		size_t index = 0;
+		char *argv[MAX_EXEC_ARGS + 2];
+
+		dup2(stdout_pipe[1], STDOUT_FILENO);
+		dup2(stderr_pipe[1], STDERR_FILENO);
+		close(stdout_pipe[0]);
+		close(stdout_pipe[1]);
+		close(stderr_pipe[0]);
+		close(stderr_pipe[1]);
+
+		if (spec->cwd[0] && chdir(spec->cwd) != 0) {
+			fprintf(stderr, "failed to chdir to %s: %s\n", spec->cwd,
+				strerror(errno));
+			_exit(127);
+		}
+
+		if (strcmp(spec->match_mode, "exact") == 0 && spec->command[0]) {
+			argv[0] = (char *)spec->command;
+			for (index = 0; index < spec->arg_count &&
+					     index < ARRAY_SIZE(spec->args);
+			     index++)
+				argv[index + 1] = (char *)spec->args[index];
+			argv[index + 1] = NULL;
+			execvp(spec->command, argv);
+			fprintf(stderr, "failed to exec %s: %s\n", spec->command,
+				strerror(errno));
+			_exit(127);
+		}
+
+		execl("/bin/sh", "sh", "-lc", spec->raw_command, (char *)NULL);
+		fprintf(stderr, "failed to exec shell command: %s\n",
+			strerror(errno));
+		_exit(127);
+	}
+
+	close(stdout_pipe[1]);
+	close(stderr_pipe[1]);
+
+	if (!read_pipe_output(stdout_pipe[0], stdout_text)) {
+		close(stdout_pipe[0]);
+		close(stderr_pipe[0]);
+		waitpid(pid, NULL, 0);
+		return false;
+	}
+	close(stdout_pipe[0]);
+
+	if (!read_pipe_output(stderr_pipe[0], stderr_text)) {
+		close(stderr_pipe[0]);
+		waitpid(pid, NULL, 0);
+		free(*stdout_text);
+		*stdout_text = NULL;
+		return false;
+	}
+	close(stderr_pipe[0]);
+
+	if (waitpid(pid, &status, 0) < 0) {
+		free(*stdout_text);
+		free(*stderr_text);
+		*stdout_text = NULL;
+		*stderr_text = NULL;
+		return false;
+	}
+
+	if (WIFEXITED(status))
+		*exit_code = WEXITSTATUS(status);
+	else if (WIFSIGNALED(status))
+		*exit_code = 128 + WTERMSIG(status);
+	else
+		*exit_code = -1;
+
+	trim_output(*stdout_text);
+	trim_output(*stderr_text);
+	return true;
+}
+
+static bool compute_exec_result_digest(int exit_code, const char *stdout_text,
+				       const char *stderr_text,
+				       char out_hex[OC_TA_MAX_DIGEST])
+{
+	EVP_MD_CTX *ctx = NULL;
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int digest_len = 0;
+	char exit_raw[32];
+	const char *status = exit_code == 0 ? "ok" : "error";
+	size_t index = 0;
+
+	ctx = EVP_MD_CTX_new();
+	if (!ctx)
+		return false;
+	if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) <= 0)
+		goto err;
+
+	snprintf(exit_raw, sizeof(exit_raw), "%d", exit_code);
+	if (EVP_DigestUpdate(ctx, status, strlen(status)) <= 0 ||
+	    EVP_DigestUpdate(ctx, "\n", 1) <= 0 ||
+	    EVP_DigestUpdate(ctx, exit_raw, strlen(exit_raw)) <= 0 ||
+	    EVP_DigestUpdate(ctx, "\n", 1) <= 0 ||
+	    EVP_DigestUpdate(ctx, stdout_text ? stdout_text : "",
+			     strlen(stdout_text ? stdout_text : "")) <= 0 ||
+	    EVP_DigestUpdate(ctx, "\n", 1) <= 0 ||
+	    EVP_DigestUpdate(ctx, stderr_text ? stderr_text : "",
+			     strlen(stderr_text ? stderr_text : "")) <= 0)
+		goto err;
+
+	if (EVP_DigestFinal_ex(ctx, digest, &digest_len) <= 0)
+		goto err;
+	if (digest_len * 2 + 1 > OC_TA_MAX_DIGEST)
+		goto err;
+
+	for (index = 0; index < digest_len; index++)
+		snprintf(out_hex + index * 2, 3, "%02x", digest[index]);
+	out_hex[digest_len * 2] = '\0';
+	EVP_MD_CTX_free(ctx);
+	return true;
+err:
+	EVP_MD_CTX_free(ctx);
+	return false;
+}
+
+static char *build_remote_exec_complete_body(const struct scope_request *request,
+					     const char *status_text_value,
+					     const char *result_digest)
+{
+	char *escaped_req_id = NULL;
+	char *escaped_sid = NULL;
+	char *escaped_tool_name = NULL;
+	char *escaped_action = NULL;
+	char *escaped_object = NULL;
+	char *escaped_status = NULL;
+	char *escaped_digest = NULL;
+	char *json = NULL;
+	int written = 0;
+
+	escaped_req_id = json_escape_string(request->req_id);
+	escaped_sid = json_escape_string(request->sid);
+	escaped_tool_name = json_escape_string(request->tool_name);
+	escaped_action = json_escape_string(request->action);
+	escaped_object = json_escape_string(request->object);
+	escaped_status = json_escape_string(status_text_value);
+	escaped_digest = json_escape_string(result_digest);
+	if (!escaped_req_id || !escaped_sid || !escaped_tool_name || !escaped_action ||
+	    !escaped_object || !escaped_status || !escaped_digest)
+		goto out;
+
+	written = snprintf(
+		NULL, 0,
+		"{\"reqId\":%s,\"sid\":%s,\"toolName\":%s,\"action\":%s,"
+		"\"object\":%s,\"status\":%s,\"resultDigest\":%s}",
+		escaped_req_id, escaped_sid, escaped_tool_name, escaped_action,
+		escaped_object, escaped_status, escaped_digest);
+	if (written < 0)
+		goto out;
+
+	json = malloc((size_t)written + 1);
+	if (!json)
+		goto out;
+
+	snprintf(json, (size_t)written + 1,
+		 "{\"reqId\":%s,\"sid\":%s,\"toolName\":%s,\"action\":%s,"
+		 "\"object\":%s,\"status\":%s,\"resultDigest\":%s}",
+		 escaped_req_id, escaped_sid, escaped_tool_name, escaped_action,
+		 escaped_object, escaped_status, escaped_digest);
+out:
+	free(escaped_req_id);
+	free(escaped_sid);
+	free(escaped_tool_name);
+	free(escaped_action);
+	free(escaped_object);
+	free(escaped_status);
+	free(escaped_digest);
+	return json;
+}
+
+static char *build_remote_exec_response(const char *phase, bool authorized,
+					bool executed, bool completed,
+					const char *authorize_json,
+					const char *execution_json,
+					const char *complete_json)
+{
+	char *escaped_phase = json_escape_string(phase ? phase : "error");
+	char *json = NULL;
+	int written = 0;
+
+	if (!escaped_phase)
+		return NULL;
+
+	written = snprintf(NULL, 0,
+			   "{\"ok\":%s,\"phase\":%s,\"authorized\":%s,"
+			   "\"executed\":%s,\"completed\":%s,\"authorize\":%s,"
+			   "\"execution\":%s,\"complete\":%s}",
+			   bool_json(authorized && executed && completed),
+			   escaped_phase, bool_json(authorized),
+			   bool_json(executed), bool_json(completed),
+			   authorize_json ? authorize_json : "null",
+			   execution_json ? execution_json : "null",
+			   complete_json ? complete_json : "null");
+	if (written < 0)
+		goto out;
+
+	json = malloc((size_t)written + 1);
+	if (!json)
+		goto out;
+
+	snprintf(json, (size_t)written + 1,
+		 "{\"ok\":%s,\"phase\":%s,\"authorized\":%s,"
+		 "\"executed\":%s,\"completed\":%s,\"authorize\":%s,"
+		 "\"execution\":%s,\"complete\":%s}",
+		 bool_json(authorized && executed && completed), escaped_phase,
+		 bool_json(authorized), bool_json(executed),
+		 bool_json(completed), authorize_json ? authorize_json : "null",
+		 execution_json ? execution_json : "null",
+		 complete_json ? complete_json : "null");
+out:
+	free(escaped_phase);
+	return json;
+}
+
 static bool b64url_encode(const unsigned char *data, size_t data_len, char **out)
 {
 	size_t base64_len = 4 * ((data_len + 2) / 3);
@@ -1003,6 +1502,359 @@ static bool b64url_encode(const unsigned char *data, size_t data_len, char **out
 
 	*out = (char *)base64;
 	return true;
+}
+
+static bool b64url_decode(const char *input, unsigned char **out, size_t *out_len)
+{
+	size_t input_len = 0;
+	size_t padded_len = 0;
+	char *normalized = NULL;
+	unsigned char *decoded = NULL;
+	int decoded_len = 0;
+	size_t padding = 0;
+	size_t index = 0;
+
+	if (!input || !out || !out_len)
+		return false;
+
+	*out = NULL;
+	*out_len = 0;
+	input_len = strlen(input);
+	padding = (4 - (input_len % 4)) % 4;
+	padded_len = input_len + padding;
+
+	normalized = calloc(1, padded_len + 1);
+	if (!normalized)
+		return false;
+	memcpy(normalized, input, input_len);
+	for (index = 0; index < input_len; index++) {
+		if (normalized[index] == '-')
+			normalized[index] = '+';
+		else if (normalized[index] == '_')
+			normalized[index] = '/';
+	}
+	for (index = 0; index < padding; index++)
+		normalized[input_len + index] = '=';
+
+	decoded = calloc(1, 3 * (padded_len / 4) + 1);
+	if (!decoded)
+		goto out;
+
+	decoded_len = EVP_DecodeBlock(decoded, (const unsigned char *)normalized,
+				      (int)padded_len);
+	if (decoded_len < 0)
+		goto out;
+	while (padded_len > 0 && normalized[padded_len - 1] == '=') {
+		decoded_len--;
+		padded_len--;
+	}
+	if (decoded_len < 0)
+		goto out;
+
+	*out = decoded;
+	*out_len = (size_t)decoded_len;
+	decoded = NULL;
+	free(normalized);
+	return true;
+out:
+	free(normalized);
+	free(decoded);
+	return false;
+}
+
+static bool streq_or_empty(const char *left, const char *right)
+{
+	const char *lhs = left ? left : "";
+	const char *rhs = right ? right : "";
+
+	return strcmp(lhs, rhs) == 0;
+}
+
+static bool parse_approved_exec_binding(const char *remote_dispatch_json,
+					struct approved_exec_binding *binding)
+{
+	char approved_exec_raw[MAX_SCOPE_JSON];
+	char raw_args[MAX_SCOPE_JSON];
+
+	memset(binding, 0, sizeof(*binding));
+	memset(approved_exec_raw, 0, sizeof(approved_exec_raw));
+	memset(raw_args, 0, sizeof(raw_args));
+
+	if (!json_get_raw_value(remote_dispatch_json, "approvedExec",
+				approved_exec_raw, sizeof(approved_exec_raw)))
+		return false;
+	if (!json_get_string(approved_exec_raw, "rawCommand",
+			     binding->raw_command,
+			     sizeof(binding->raw_command)))
+		return false;
+	if (!json_get_string(approved_exec_raw, "command", binding->command,
+			     sizeof(binding->command)))
+		return false;
+	json_get_string(approved_exec_raw, "cwd", binding->cwd,
+			sizeof(binding->cwd));
+	json_get_string(approved_exec_raw, "workspaceRoot",
+			binding->workspace_root,
+			sizeof(binding->workspace_root));
+	json_get_string(remote_dispatch_json, "remotePlatform",
+			binding->remote_platform,
+			sizeof(binding->remote_platform));
+
+	if (json_get_raw_value(approved_exec_raw, "args", raw_args,
+			       sizeof(raw_args)) &&
+	    !json_parse_string_array(raw_args, binding->args,
+				     ARRAY_SIZE(binding->args),
+				     &binding->arg_count))
+		return false;
+
+	return true;
+}
+
+static bool approved_exec_matches_request(
+	const struct approved_exec_binding *binding,
+	const struct scope_request *request,
+	const struct exec_spec *spec)
+{
+	size_t index = 0;
+
+	if (!binding->raw_command[0] || !binding->command[0])
+		return false;
+	if (strcmp(binding->raw_command, spec->raw_command) != 0)
+		return false;
+	if (strcmp(binding->command, spec->command) != 0)
+		return false;
+	if (!streq_or_empty(binding->cwd, spec->cwd))
+		return false;
+	if (!streq_or_empty(binding->workspace_root, request->workspace_root))
+		return false;
+	if (binding->remote_platform[0] &&
+	    strcasecmp(binding->remote_platform, "trustzone") != 0 &&
+	    strcasecmp(binding->remote_platform, "optee") != 0)
+		return false;
+	if (binding->arg_count != spec->arg_count)
+		return false;
+	for (index = 0; index < binding->arg_count; index++) {
+		if (strcmp(binding->args[index], spec->args[index]) != 0)
+			return false;
+	}
+
+	return true;
+}
+
+static bool verify_ed25519_signature_with_public_key_file(
+	const char *public_key_file_path, const char *signed_input,
+	const unsigned char *signature, size_t signature_len)
+{
+	bool ok = false;
+	FILE *public_key_file = NULL;
+	EVP_PKEY *public_key = NULL;
+	EVP_MD_CTX *md_ctx = NULL;
+
+	if (!public_key_file_path || !public_key_file_path[0] || !signed_input ||
+	    !signature || signature_len == 0)
+		return false;
+
+	public_key_file = fopen(public_key_file_path, "r");
+	if (!public_key_file)
+		goto out;
+	public_key = PEM_read_PUBKEY(public_key_file, NULL, NULL, NULL);
+	fclose(public_key_file);
+	public_key_file = NULL;
+	if (!public_key)
+		goto out;
+
+	md_ctx = EVP_MD_CTX_new();
+	if (!md_ctx)
+		goto out;
+	if (EVP_DigestVerifyInit(md_ctx, NULL, NULL, NULL, public_key) <= 0)
+		goto out;
+	if (EVP_DigestVerify(md_ctx, signature, signature_len,
+			     (const unsigned char *)signed_input,
+			     strlen(signed_input)) <= 0)
+		goto out;
+
+	ok = true;
+out:
+	if (md_ctx)
+		EVP_MD_CTX_free(md_ctx);
+	if (public_key)
+		EVP_PKEY_free(public_key);
+	if (public_key_file)
+		fclose(public_key_file);
+	return ok;
+}
+
+static char *verify_upstream_local_approval(const struct server_config *config,
+					    const char *local_approval_json,
+					    const struct scope_request *request,
+					    const struct exec_spec *spec)
+{
+	char payload_json[MAX_REQUEST_JSON];
+	char envelope_req_id[OC_TA_MAX_ID];
+	char envelope_sid[OC_TA_MAX_ID];
+	char envelope_action[OC_TA_MAX_ACTION];
+	char envelope_object[OC_TA_MAX_OBJECT];
+	char envelope_digest[OC_TA_MAX_DIGEST];
+	char token[MAX_REQUEST_JSON];
+	char payload_req_id[OC_TA_MAX_ID];
+	char payload_sid[OC_TA_MAX_ID];
+	char payload_action[OC_TA_MAX_ACTION];
+	char payload_object[OC_TA_MAX_OBJECT];
+	char payload_digest[OC_TA_MAX_DIGEST];
+	char scope_raw[MAX_SCOPE_JSON];
+	char remote_dispatch_raw[MAX_SCOPE_JSON];
+	char *token_copy = NULL;
+	char *separator = NULL;
+	char *payload_b64 = NULL;
+	char *signature_b64 = NULL;
+	unsigned char *payload_bytes = NULL;
+	unsigned char *signature_bytes = NULL;
+	size_t payload_len = 0;
+	size_t signature_len = 0;
+	long long expires_at_ms = 0;
+	struct approved_exec_binding binding;
+
+	memset(envelope_req_id, 0, sizeof(envelope_req_id));
+	memset(payload_json, 0, sizeof(payload_json));
+	memset(envelope_sid, 0, sizeof(envelope_sid));
+	memset(envelope_action, 0, sizeof(envelope_action));
+	memset(envelope_object, 0, sizeof(envelope_object));
+	memset(envelope_digest, 0, sizeof(envelope_digest));
+	memset(token, 0, sizeof(token));
+	memset(payload_req_id, 0, sizeof(payload_req_id));
+	memset(payload_sid, 0, sizeof(payload_sid));
+	memset(payload_action, 0, sizeof(payload_action));
+	memset(payload_object, 0, sizeof(payload_object));
+	memset(payload_digest, 0, sizeof(payload_digest));
+	memset(scope_raw, 0, sizeof(scope_raw));
+	memset(remote_dispatch_raw, 0, sizeof(remote_dispatch_raw));
+	memset(&binding, 0, sizeof(binding));
+
+	if (!config->upstream_tdx_public_key_file[0])
+		return build_error_json("invalid_local_approval",
+					"upstream TDX public key is not configured");
+
+	if (!json_get_string_top_level(local_approval_json, "reqId",
+				       envelope_req_id,
+				       sizeof(envelope_req_id)) ||
+	    !json_get_string_top_level(local_approval_json, "sid",
+				       envelope_sid, sizeof(envelope_sid)) ||
+	    !json_get_string_top_level(local_approval_json, "action",
+				       envelope_action,
+				       sizeof(envelope_action)) ||
+	    !json_get_string_top_level(local_approval_json, "object",
+				       envelope_object,
+				       sizeof(envelope_object)) ||
+	    !json_get_string_top_level(local_approval_json,
+				       "normalizedScopeDigest",
+				       envelope_digest,
+				       sizeof(envelope_digest)) ||
+	    !json_get_string_top_level(local_approval_json, "token", token,
+				       sizeof(token)))
+		return build_error_json("invalid_local_approval",
+					"localApproval is missing required fields");
+
+	token_copy = strdup(token);
+	if (!token_copy)
+		return build_error_json("invalid_local_approval",
+					"failed to allocate localApproval token buffer");
+	separator = strchr(token_copy, '.');
+	if (!separator) {
+		free(token_copy);
+		return build_error_json("invalid_local_approval",
+					"localApproval token format is invalid");
+	}
+	*separator = '\0';
+	payload_b64 = token_copy;
+	signature_b64 = separator + 1;
+	if (!payload_b64[0] || !signature_b64[0]) {
+		free(token_copy);
+		return build_error_json("invalid_local_approval",
+					"localApproval token format is invalid");
+	}
+
+	if (!b64url_decode(payload_b64, &payload_bytes, &payload_len) ||
+	    !b64url_decode(signature_b64, &signature_bytes, &signature_len)) {
+		free(token_copy);
+		free(payload_bytes);
+		free(signature_bytes);
+		return build_error_json("invalid_local_approval",
+					"failed to decode localApproval token");
+	}
+	if (!verify_ed25519_signature_with_public_key_file(
+		    config->upstream_tdx_public_key_file, payload_b64,
+		    signature_bytes, signature_len)) {
+		free(token_copy);
+		free(payload_bytes);
+		free(signature_bytes);
+		return build_error_json("invalid_local_approval",
+					"localApproval token signature verification failed");
+	}
+
+	if (payload_len == 0 || payload_len + 1 > sizeof(payload_json)) {
+		free(token_copy);
+		free(payload_bytes);
+		free(signature_bytes);
+		return build_error_json("invalid_local_approval",
+					"localApproval token payload is invalid");
+	}
+	memcpy(payload_json, payload_bytes, payload_len);
+	payload_json[payload_len] = '\0';
+	free(payload_bytes);
+	payload_bytes = NULL;
+	free(signature_bytes);
+	signature_bytes = NULL;
+
+	if (!json_get_string(payload_json, "reqId", payload_req_id,
+			     sizeof(payload_req_id)) ||
+	    !json_get_string(payload_json, "sid", payload_sid,
+			     sizeof(payload_sid)) ||
+	    !json_get_string(payload_json, "action", payload_action,
+			     sizeof(payload_action)) ||
+	    !json_get_string(payload_json, "object", payload_object,
+			     sizeof(payload_object)) ||
+	    !json_get_string(payload_json,
+			     "normalizedScopeDigest", payload_digest,
+			     sizeof(payload_digest)) ||
+	    !json_get_raw_value(payload_json, "scope", scope_raw,
+				sizeof(scope_raw))) {
+		free(token_copy);
+		return build_error_json("invalid_local_approval",
+					"localApproval token payload is missing required fields");
+	}
+	if (strcmp(envelope_req_id, payload_req_id) != 0 ||
+	    strcmp(envelope_sid, payload_sid) != 0 ||
+	    strcmp(envelope_action, payload_action) != 0 ||
+	    strcmp(envelope_object, payload_object) != 0 ||
+	    strcmp(envelope_digest, payload_digest) != 0) {
+		free(token_copy);
+		return build_error_json("invalid_local_approval",
+					"localApproval envelope does not match the signed token");
+	}
+	if (!json_get_int64(payload_json, "expiresAtMs", &expires_at_ms) ||
+	    expires_at_ms < now_ms()) {
+		free(token_copy);
+		return build_error_json("invalid_local_approval",
+					"localApproval token is expired");
+	}
+	if (!json_get_raw_value(scope_raw, "remoteDispatch", remote_dispatch_raw,
+				sizeof(remote_dispatch_raw))) {
+		free(token_copy);
+		return build_error_json("invalid_local_approval",
+					"localApproval token is missing remoteDispatch scope");
+	}
+	if (!parse_approved_exec_binding(remote_dispatch_raw, &binding)) {
+		free(token_copy);
+		return build_error_json("invalid_local_approval",
+					"localApproval token is missing approvedExec binding");
+	}
+	if (!approved_exec_matches_request(&binding, request, spec)) {
+		free(token_copy);
+		return build_error_json("invalid_local_approval",
+					"remote command differs from TDX-approved command binding");
+	}
+
+	free(token_copy);
+	return NULL;
 }
 
 static bool mint_scope_token(const struct server_config *config,
@@ -1230,37 +2082,38 @@ static bool parse_authorize_request(const char *json, struct scope_request *requ
 	}
 	copy_text(request->request_json, sizeof(request->request_json), json);
 
-	if (!json_get_string(json, "reqId", request->req_id,
-			     sizeof(request->req_id))) {
+	if (!json_get_string_top_level(json, "reqId", request->req_id,
+				       sizeof(request->req_id))) {
 		*error_message = build_error_json("bad_request",
 						"missing or invalid field: reqId");
 		return false;
 	}
-	if (!json_get_string(json, "sid", request->sid, sizeof(request->sid))) {
+	if (!json_get_string_top_level(json, "sid", request->sid,
+				       sizeof(request->sid))) {
 		*error_message = build_error_json("bad_request",
 						"missing or invalid field: sid");
 		return false;
 	}
-	if (!json_get_string(json, "toolName", request->tool_name,
-			     sizeof(request->tool_name))) {
+	if (!json_get_string_top_level(json, "toolName", request->tool_name,
+				       sizeof(request->tool_name))) {
 		*error_message = build_error_json("bad_request",
 						"missing or invalid field: toolName");
 		return false;
 	}
-	if (!json_get_string(json, "action", request->action,
-			     sizeof(request->action))) {
+	if (!json_get_string_top_level(json, "action", request->action,
+				       sizeof(request->action))) {
 		*error_message = build_error_json("bad_request",
 						"missing or invalid field: action");
 		return false;
 	}
-	if (!json_get_string(json, "object", request->object,
-			     sizeof(request->object))) {
+	if (!json_get_string_top_level(json, "object", request->object,
+				       sizeof(request->object))) {
 		*error_message = build_error_json("bad_request",
 						"missing or invalid field: object");
 		return false;
 	}
-	if (!json_get_string(json, "level", request->level,
-			     sizeof(request->level))) {
+	if (!json_get_string_top_level(json, "level", request->level,
+				       sizeof(request->level))) {
 		*error_message = build_error_json("bad_request",
 						"missing or invalid field: level");
 		return false;
@@ -1269,34 +2122,37 @@ static bool parse_authorize_request(const char *json, struct scope_request *requ
 	request->seq = 1;
 	request->ttl_ms = default_ttl_ms;
 	request->issued_at_ms = 0;
-	json_get_int64(json, "seq", &seq);
-	json_get_int64(json, "ttlMs", &ttl_ms);
-	json_get_int64(json, "issuedAtMs", &request->issued_at_ms);
+	json_get_int64_top_level(json, "seq", &seq);
+	json_get_int64_top_level(json, "ttlMs", &ttl_ms);
+	json_get_int64_top_level(json, "issuedAtMs", &request->issued_at_ms);
 	request->seq = (int)seq;
 	request->ttl_ms = (int)ttl_ms;
 	if (request->ttl_ms <= 0)
 		request->ttl_ms = default_ttl_ms;
 
-	if (!json_get_string(json, "normalizedScopeDigest",
-			     request->normalized_scope_digest,
-			     sizeof(request->normalized_scope_digest))) {
+	if (!json_get_string_top_level(json, "normalizedScopeDigest",
+				       request->normalized_scope_digest,
+				       sizeof(request->normalized_scope_digest))) {
 		*error_message = build_error_json(
 			"bad_request",
 			"missing or invalid field: normalizedScopeDigest");
 		return false;
 	}
 
-	if (!json_get_raw_value(json, "scope", request->scope_raw,
-				sizeof(request->scope_raw)))
+	if (!json_get_raw_value_top_level(json, "scope", request->scope_raw,
+					  sizeof(request->scope_raw)))
 		copy_text(request->scope_raw, sizeof(request->scope_raw), "{}");
-	if (!json_get_string(json, "workspaceRoot", request->workspace_root,
-			     sizeof(request->workspace_root))) {
+	if (!json_get_string_top_level(json, "workspaceRoot",
+				       request->workspace_root,
+				       sizeof(request->workspace_root))) {
 		request->workspace_root[0] = '\0';
 	}
-	if (!json_get_string(json, "sessionKey", request->session_binding,
-			     sizeof(request->session_binding)) &&
-	    !json_get_string(json, "sessionId", request->session_binding,
-			     sizeof(request->session_binding))) {
+	if (!json_get_string_top_level(json, "sessionKey",
+				       request->session_binding,
+				       sizeof(request->session_binding)) &&
+	    !json_get_string_top_level(json, "sessionId",
+				       request->session_binding,
+				       sizeof(request->session_binding))) {
 		request->session_binding[0] = '\0';
 	}
 
@@ -1489,7 +2345,9 @@ static char *run_confirm(struct server_state *state, const char *body,
 	char *token = NULL;
 	char *error_json = NULL;
 	int exit_code = 0;
-	char *argv[12];
+	char seq_raw[16];
+	char ttl_raw[16];
+	char *argv[34];
 	size_t argc = 0;
 
 	if (!parse_required_string_field(body, "confirmationRequestId",
@@ -1524,6 +2382,34 @@ static char *run_confirm(struct server_state *state, const char *body,
 	argv[argc++] = operator_id;
 	argv[argc++] = "--decision";
 	argv[argc++] = decision;
+	if (pending) {
+		snprintf(seq_raw, sizeof(seq_raw), "%d", pending->request.seq);
+		snprintf(ttl_raw, sizeof(ttl_raw), "%d", pending->request.ttl_ms);
+		argv[argc++] = "--req-id";
+		argv[argc++] = pending->request.req_id;
+		argv[argc++] = "--sid";
+		argv[argc++] = pending->request.sid;
+		argv[argc++] = "--tool-name";
+		argv[argc++] = pending->request.tool_name;
+		argv[argc++] = "--action";
+		argv[argc++] = pending->request.action;
+		argv[argc++] = "--object";
+		argv[argc++] = pending->request.object;
+		argv[argc++] = "--level";
+		argv[argc++] = pending->request.level;
+		argv[argc++] = "--normalized-scope-digest";
+		argv[argc++] = pending->request.normalized_scope_digest;
+		argv[argc++] = "--scope-json";
+		argv[argc++] = pending->request.scope_raw;
+		argv[argc++] = "--workspace-root";
+		argv[argc++] = pending->request.workspace_root;
+		argv[argc++] = "--session-binding";
+		argv[argc++] = pending->request.session_binding;
+		argv[argc++] = "--seq";
+		argv[argc++] = seq_raw;
+		argv[argc++] = "--ttl-ms";
+		argv[argc++] = ttl_raw;
+	}
 	argv[argc] = NULL;
 
 	if (!run_ca_command(argv, &output, &exit_code)) {
@@ -1628,6 +2514,225 @@ static char *run_complete(struct server_state *state, const char *body,
 	return output;
 }
 
+static char *run_remote_exec(struct server_state *state, const char *body,
+			     int *status)
+{
+	char authorize_request_json[MAX_REQUEST_JSON];
+	char local_approval_json[MAX_REQUEST_JSON];
+	struct scope_request request;
+	struct exec_spec spec;
+	char *authorize_output = NULL;
+	char *complete_body = NULL;
+	char *complete_output = NULL;
+	char *execution_json = NULL;
+	char *response_json = NULL;
+	char *stdout_text = NULL;
+	char *stderr_text = NULL;
+	char *escaped_status = NULL;
+	char *escaped_stdout = NULL;
+	char *escaped_stderr = NULL;
+	char *escaped_digest = NULL;
+	char result_digest[OC_TA_MAX_DIGEST];
+	long long started_at_ms = 0;
+	long long finished_at_ms = 0;
+	int authorize_status = 0;
+	int complete_status = 0;
+	int exit_code = -1;
+	int written = 0;
+	bool allow = false;
+	bool executed = false;
+	bool completed = false;
+	char decision[OC_TA_MAX_ACTION];
+	char *error_json = NULL;
+
+	memset(local_approval_json, 0, sizeof(local_approval_json));
+
+	if (!json_get_raw_value_top_level(body, "authorizeRequest",
+					  authorize_request_json,
+					  sizeof(authorize_request_json))) {
+		*status = 400;
+		return build_error_json("invalid_remote_exec",
+				      "missing authorizeRequest");
+	}
+
+	if (!parse_authorize_request(authorize_request_json, &request,
+				     state->config.scope_token_ttl_ms,
+				     &error_json)) {
+		*status = 400;
+		return error_json;
+	}
+
+	if (!parse_exec_spec(&request, &spec, &error_json)) {
+		*status = 400;
+		return error_json;
+	}
+	if (json_get_raw_value_top_level(body, "localApproval",
+					 local_approval_json,
+					 sizeof(local_approval_json))) {
+		error_json = verify_upstream_local_approval(&state->config,
+							    local_approval_json,
+							    &request, &spec);
+		if (error_json) {
+			*status = 200;
+			response_json = build_remote_exec_response(
+				"local-approval-invalid", false, false, false,
+				error_json, NULL, NULL);
+			free(error_json);
+			return response_json ? response_json :
+				build_error_json("invalid_local_approval",
+					       "failed to build local-approval-invalid response");
+		}
+	}
+
+	authorize_output = run_authorize(state, authorize_request_json,
+					 &authorize_status);
+	if (!authorize_output) {
+		*status = 500;
+		return build_error_json("remote_authorize_failed",
+				      "authorize returned no response");
+	}
+	if (authorize_status != 200) {
+		*status = 200;
+		response_json = build_remote_exec_response("authorize-error", false,
+							  false, false,
+							  authorize_output, NULL,
+							  NULL);
+		free(authorize_output);
+		return response_json ? response_json :
+			build_error_json("remote_authorize_failed",
+				       "failed to build authorize-error response");
+	}
+
+	if (!json_get_bool(authorize_output, "allow", &allow))
+		allow = false;
+	if (!json_get_string(authorize_output, "decision", decision,
+			     sizeof(decision)))
+		copy_text(decision, sizeof(decision), allow ? "dia" : "ddeny");
+
+	if (!allow || strcmp(decision, "duc") == 0) {
+		*status = 200;
+		response_json = build_remote_exec_response(
+			strcmp(decision, "duc") == 0 ? "confirmation-required" :
+						       "authorize-denied",
+			false, false, false, authorize_output, NULL, NULL);
+		free(authorize_output);
+		return response_json ? response_json :
+			build_error_json("remote_authorize_failed",
+				       "failed to build denied response");
+	}
+	if (strcmp(decision, "die") == 0) {
+		*status = 200;
+		response_json = build_remote_exec_response(
+			"authorize-isolated-unavailable", false, false, false,
+			authorize_output, NULL, NULL);
+		free(authorize_output);
+		return response_json ? response_json :
+			build_error_json("remote_authorize_failed",
+				       "failed to build isolated-unavailable response");
+	}
+
+	started_at_ms = now_ms();
+	if (!run_exec_spec(&spec, &stdout_text, &stderr_text, &exit_code)) {
+		*status = 500;
+		free(authorize_output);
+		return build_error_json("remote_exec_failed",
+				      "failed to execute remote command");
+	}
+	finished_at_ms = now_ms();
+	executed = true;
+
+	if (!compute_exec_result_digest(exit_code, stdout_text, stderr_text,
+					 result_digest)) {
+		*status = 500;
+		free(authorize_output);
+		free(stdout_text);
+		free(stderr_text);
+		return build_error_json("remote_exec_failed",
+				      "failed to compute result digest");
+	}
+
+	complete_body = build_remote_exec_complete_body(
+		&request, exit_code == 0 ? "ok" : "error", result_digest);
+	if (!complete_body) {
+		*status = 500;
+		free(authorize_output);
+		free(stdout_text);
+		free(stderr_text);
+		return build_error_json("remote_complete_failed",
+				      "failed to build complete request");
+	}
+
+	complete_output = run_complete(state, complete_body, &complete_status);
+	completed = complete_output && complete_status == 200;
+
+	escaped_status = json_escape_string(exit_code == 0 ? "ok" : "error");
+	escaped_stdout = json_escape_string(stdout_text ? stdout_text : "");
+	escaped_stderr = json_escape_string(stderr_text ? stderr_text : "");
+	escaped_digest = json_escape_string(result_digest);
+	if (!escaped_status || !escaped_stdout || !escaped_stderr ||
+	    !escaped_digest) {
+		*status = 500;
+		response_json = build_error_json("remote_exec_failed",
+					       "failed to encode execution result");
+		goto out;
+	}
+
+	written = snprintf(
+		NULL, 0,
+		"{\"startedAtMs\":%lld,\"finishedAtMs\":%lld,\"durationMs\":%lld,"
+		"\"exitCode\":%d,\"status\":%s,\"stdout\":%s,\"stderr\":%s,"
+		"\"resultDigest\":%s}",
+		started_at_ms, finished_at_ms, finished_at_ms - started_at_ms,
+		exit_code, escaped_status, escaped_stdout, escaped_stderr,
+		escaped_digest);
+	if (written < 0) {
+		*status = 500;
+		response_json = build_error_json("remote_exec_failed",
+					       "failed to size execution result");
+		goto out;
+	}
+
+	execution_json = malloc((size_t)written + 1);
+	if (!execution_json) {
+		*status = 500;
+		response_json = build_error_json("remote_exec_failed",
+					       "failed to allocate execution result");
+		goto out;
+	}
+
+	snprintf(execution_json, (size_t)written + 1,
+		 "{\"startedAtMs\":%lld,\"finishedAtMs\":%lld,\"durationMs\":%lld,"
+		 "\"exitCode\":%d,\"status\":%s,\"stdout\":%s,\"stderr\":%s,"
+		 "\"resultDigest\":%s}",
+		 started_at_ms, finished_at_ms, finished_at_ms - started_at_ms,
+		 exit_code, escaped_status, escaped_stdout, escaped_stderr,
+		 escaped_digest);
+
+	response_json = build_remote_exec_response(
+		completed ? "completed" : "complete-error", true, executed,
+		completed, authorize_output, execution_json, complete_output);
+	if (!response_json) {
+		*status = 500;
+		response_json = build_error_json("remote_exec_failed",
+					       "failed to build response");
+		goto out;
+	}
+
+	*status = 200;
+out:
+	free(authorize_output);
+	free(complete_body);
+	free(complete_output);
+	free(execution_json);
+	free(stdout_text);
+	free(stderr_text);
+	free(escaped_status);
+	free(escaped_stdout);
+	free(escaped_stderr);
+	free(escaped_digest);
+	return response_json;
+}
+
 static char *dispatch_request(struct server_state *state,
 			      const struct http_request *request, int *status)
 {
@@ -1647,6 +2752,8 @@ static char *dispatch_request(struct server_state *state,
 			return run_confirm(state, request->body, status);
 		if (strcmp(request->path, "/v1/trusted/complete") == 0)
 			return run_complete(state, request->body, status);
+		if (strcmp(request->path, "/v1/trusted/remote-exec") == 0)
+			return run_remote_exec(state, request->body, status);
 		*status = 404;
 		return build_error_json("not_found", "not_found");
 	}
@@ -1662,6 +2769,7 @@ static void usage(const char *argv0)
 		"  %s [--bind ADDR] [--port PORT] [--ca-binary PATH]\n"
 		"     [--verify-mode none|hmac-sha256|ed25519] [--hmac-key KEY]\n"
 		"     [--signing-private-key-file PATH]\n"
+		"     [--upstream-tdx-public-key-file PATH]\n"
 		"     [--scope-token-ttl-ms N] [--confirmation-ttl-ms N]\n",
 		argv0);
 }
@@ -1698,6 +2806,9 @@ static int parse_args(int argc, char *argv[], struct server_config *config)
 		copy_text(config->signing_private_key_file,
 			  sizeof(config->signing_private_key_file),
 			  DEFAULT_SIGNING_PRIVATE_KEY_FILE);
+	copy_text(config->upstream_tdx_public_key_file,
+		  sizeof(config->upstream_tdx_public_key_file),
+		  getenv("OPTEE_TRUSTED_UPSTREAM_TDX_PUBLIC_KEY_FILE"));
 	config->scope_token_ttl_ms =
 		coerce_int(getenv("OPTEE_SCOPE_TOKEN_TTL_MS"),
 			   DEFAULT_SCOPE_TOKEN_TTL_MS);
@@ -1727,6 +2838,11 @@ static int parse_args(int argc, char *argv[], struct server_config *config)
 			   index + 1 < argc) {
 			copy_text(config->signing_private_key_file,
 				  sizeof(config->signing_private_key_file),
+				  argv[++index]);
+		} else if (strcmp(argv[index], "--upstream-tdx-public-key-file") == 0 &&
+			   index + 1 < argc) {
+			copy_text(config->upstream_tdx_public_key_file,
+				  sizeof(config->upstream_tdx_public_key_file),
 				  argv[++index]);
 		} else if (strcmp(argv[index], "--scope-token-ttl-ms") == 0 &&
 			   index + 1 < argc) {
@@ -1760,13 +2876,13 @@ static int parse_args(int argc, char *argv[], struct server_config *config)
 	if (strcmp(config->verify_mode, "hmac-sha256") == 0 &&
 	    !config->hmac_key[0]) {
 		fprintf(stderr,
-			"verify mode hmac-sha256 requires --hmac-key or OPTEE_TRUSTED_HMAC_KEY\n");
+				"verify mode hmac-sha256 requires --hmac-key or OPTEE_TRUSTED_HMAC_KEY\n");
 		return 1;
 	}
 	if (strcmp(config->verify_mode, "ed25519") == 0 &&
 	    !config->signing_private_key_file[0]) {
 		fprintf(stderr,
-			"verify mode ed25519 requires --signing-private-key-file or OPTEE_TRUSTED_SIGNING_PRIVATE_KEY_FILE\n");
+				"verify mode ed25519 requires --signing-private-key-file or OPTEE_TRUSTED_SIGNING_PRIVATE_KEY_FILE\n");
 		return 1;
 	}
 	if (strcmp(config->verify_mode, "ed25519") == 0 &&

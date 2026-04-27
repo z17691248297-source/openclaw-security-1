@@ -784,7 +784,382 @@ function selectDominantAssessment(level, assessments) {
   );
 }
 
+function readRemoteDispatchField(remoteDispatch, ...keys) {
+  for (const key of keys) {
+    const value = trimText(remoteDispatch?.[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function normalizeRemoteDispatchAction(value) {
+  const normalized = trimText(value)?.toLowerCase();
+  if (!normalized) {
+    return "unknown";
+  }
+  if (["read", "query", "observe", "inspect"].includes(normalized)) {
+    return "read";
+  }
+  if (["exec", "command", "run"].includes(normalized)) {
+    return "exec";
+  }
+  if (["modify", "write", "update", "create"].includes(normalized)) {
+    return "modify";
+  }
+  if (["delete", "remove"].includes(normalized)) {
+    return "delete";
+  }
+  if (["export", "transfer", "archive"].includes(normalized)) {
+    return "export";
+  }
+  return normalized;
+}
+
+function normalizeRemoteDispatchObjectClass(value) {
+  const normalized = trimText(value)?.toLowerCase();
+  if (!normalized) {
+    return "ordinary";
+  }
+  if (["critical", "protected"].includes(normalized)) {
+    return "critical";
+  }
+  if (["sensitive", "restricted"].includes(normalized)) {
+    return "sensitive";
+  }
+  return "ordinary";
+}
+
+function normalizeRemoteDispatchEffect(value, fallbackAction) {
+  const normalized = trimText(value)?.toLowerCase();
+  if (!normalized) {
+    if (fallbackAction === "read" || fallbackAction === "exec") {
+      return "observe";
+    }
+    if (fallbackAction === "export") {
+      return "export";
+    }
+    if (fallbackAction === "modify" || fallbackAction === "delete") {
+      return "state-mutation";
+    }
+    return "unknown";
+  }
+  if (["observe", "observation", "query", "read-only", "transient"].includes(normalized)) {
+    return "observe";
+  }
+  if (["modify", "state-mutation", "mutation", "persistence"].includes(normalized)) {
+    return "state-mutation";
+  }
+  if (["privilege", "privilege-mutation", "system-state"].includes(normalized)) {
+    return "privilege-mutation";
+  }
+  if (["export", "transfer", "exfiltration"].includes(normalized)) {
+    return "export";
+  }
+  if (["archive", "packaging", "bundle"].includes(normalized)) {
+    return "archive";
+  }
+  if (["destructive", "delete", "removal"].includes(normalized)) {
+    return "destructive";
+  }
+  return normalized;
+}
+
+function evaluateStructuredRemoteDispatch(request) {
+  const remoteDispatch =
+    request?.scope?.restrictions?.remoteDispatch &&
+    typeof request.scope.restrictions.remoteDispatch === "object"
+      ? request.scope.restrictions.remoteDispatch
+      : null;
+  if (!remoteDispatch) {
+    return null;
+  }
+
+  const dispatchKind = readRemoteDispatchField(remoteDispatch, "dispatchKind")?.toLowerCase();
+  const remoteAction = normalizeRemoteDispatchAction(
+    readRemoteDispatchField(remoteDispatch, "remoteAction", "operationKind"),
+  );
+  const objectClass = normalizeRemoteDispatchObjectClass(
+    readRemoteDispatchField(remoteDispatch, "remoteObjectClass", "objectClass"),
+  );
+  const effectClass = normalizeRemoteDispatchEffect(
+    readRemoteDispatchField(remoteDispatch, "remoteEffect", "effectClass"),
+    remoteAction,
+  );
+  if (dispatchKind && dispatchKind !== "remote") {
+    return null;
+  }
+  if (!dispatchKind && remoteAction === "unknown") {
+    return null;
+  }
+
+  const remotePlatform =
+    readRemoteDispatchField(remoteDispatch, "remotePlatform", "platform") || "remote";
+  const remoteExecutor =
+    readRemoteDispatchField(remoteDispatch, "remoteExecutor", "executor") || "ree-proxy";
+  const boundary =
+    readRemoteDispatchField(remoteDispatch, "boundary", "dispatchBoundary") || "cross-boundary";
+  const crossBoundary = boundary.toLowerCase().includes("cross");
+  const targetLabel =
+    trimText(remoteDispatch.targetLabel) ||
+    trimText(remoteDispatch.remoteObject) ||
+    trimText(request?.object) ||
+    "remote-target";
+  const remoteObject = trimText(remoteDispatch.remoteObject) || targetLabel;
+
+  const actionRisk =
+    remoteAction === "read"
+      ? {
+          level: "L1",
+          reason: "cross-boundary remote observation request",
+          matchedRuleId: "remote.dispatch.action.observe",
+          commandClass: "remote-read",
+        }
+      : remoteAction === "exec"
+        ? {
+            level: "L1",
+            reason: "cross-boundary remote bounded command request",
+            matchedRuleId: "remote.dispatch.action.exec-observe",
+            commandClass: "remote-exec",
+          }
+        : remoteAction === "modify"
+          ? {
+              level: "L3",
+              reason: "cross-boundary remote state mutation request",
+              matchedRuleId: "remote.dispatch.action.modify",
+              commandClass: "remote-modify",
+            }
+          : remoteAction === "delete"
+            ? {
+                level: "L3",
+                reason: "cross-boundary remote destructive request",
+                matchedRuleId: "remote.dispatch.action.delete",
+                commandClass: "remote-delete",
+              }
+            : remoteAction === "export"
+            ? {
+                level: "L3",
+                reason: "cross-boundary remote export request",
+                matchedRuleId: "remote.dispatch.action.export",
+                commandClass: "remote-export",
+              }
+            : {
+                level: "L2",
+                reason: "unclassified cross-boundary remote request",
+                matchedRuleId: "remote.dispatch.action.unknown",
+                commandClass: "remote-unknown",
+              };
+
+  const objectRisk =
+    objectClass === "critical"
+      ? {
+          level: "L3",
+          reason: `critical remote target ${targetLabel}`,
+          matchedRuleId: "remote.dispatch.object.critical",
+          classification: "critical",
+        }
+      : objectClass === "sensitive"
+        ? {
+            level: "L2",
+            reason: `sensitive remote target ${targetLabel}`,
+            matchedRuleId: "remote.dispatch.object.sensitive",
+            classification: "sensitive",
+          }
+        : {
+            level: "L0",
+            reason: `ordinary remote target ${targetLabel}`,
+            matchedRuleId: "remote.dispatch.object.ordinary",
+            classification: "ordinary",
+          };
+
+  const contextRisk = {
+    level: crossBoundary ? "L1" : "L0",
+    reason: crossBoundary
+      ? "cross-boundary remote dispatch requires local trusted authorization"
+      : "remote dispatch metadata present",
+    matchedRuleId: crossBoundary
+      ? "remote.dispatch.context.cross-boundary"
+      : "remote.dispatch.context.local",
+    factors: {
+      multi_step: false,
+      outside_workspace: false,
+      remote_target: true,
+      shell_wrapper: false,
+      task_mismatch: false,
+      user_absent:
+        !trimText(request?.context?.sessionKey) && !trimText(request?.context?.sessionId),
+      target_count: 1,
+      object_classification: objectRisk.classification,
+      remote_platform: remotePlatform,
+      remote_executor: remoteExecutor,
+      boundary,
+      remote_effect: effectClass,
+    },
+  };
+
+  const effectRisk =
+    ["state-mutation", "privilege-mutation", "export", "archive", "destructive"].includes(
+      effectClass,
+    )
+      ? {
+          level: "L3",
+          reason:
+            effectClass === "export" || effectClass === "archive"
+              ? "cross-boundary remote export effect"
+              : effectClass === "privilege-mutation"
+                ? "cross-boundary remote privileged mutation effect"
+                : effectClass === "destructive"
+                  ? "cross-boundary remote destructive effect"
+                  : "cross-boundary remote state mutation effect",
+          matchedRuleId:
+            effectClass === "export" || effectClass === "archive"
+              ? "remote.dispatch.effect.export"
+              : effectClass === "privilege-mutation"
+                ? "remote.dispatch.effect.privilege-mutation"
+                : effectClass === "destructive"
+                  ? "remote.dispatch.effect.destructive"
+                  : "remote.dispatch.effect.modify",
+          factors: {
+            export: effectClass === "export" || effectClass === "archive",
+            destructive: effectClass === "destructive",
+            persistence: effectClass === "state-mutation",
+            privilege_mutation: effectClass === "privilege-mutation",
+            archive_packaging: effectClass === "archive",
+            remote_target: true,
+            object_classification: objectRisk.classification,
+          },
+        }
+      : effectClass === "observe"
+        ? {
+            level: "L1",
+            reason: "bounded remote observation effect",
+            matchedRuleId: "remote.dispatch.effect.observe",
+            factors: {
+              export: false,
+              destructive: false,
+              persistence: false,
+              privilege_mutation: false,
+              archive_packaging: false,
+              remote_target: true,
+              object_classification: objectRisk.classification,
+            },
+          }
+        : {
+            level: "L2",
+            reason: "unclassified remote execution effect",
+            matchedRuleId: "remote.dispatch.effect.unknown",
+            factors: {
+              export: false,
+              destructive: false,
+              persistence: false,
+              privilege_mutation: false,
+              archive_packaging: false,
+              remote_target: true,
+              object_classification: objectRisk.classification,
+            },
+          };
+
+  const denyByObject = objectClass !== "ordinary";
+  const denyByAction = ["modify", "delete", "export"].includes(remoteAction);
+  const denyByEffect = ["state-mutation", "privilege-mutation", "export", "archive", "destructive"].includes(
+    effectClass,
+  );
+  const allowObserve =
+    crossBoundary &&
+    !denyByObject &&
+    !denyByAction &&
+    !denyByEffect &&
+    ["read", "exec"].includes(remoteAction) &&
+    effectClass === "observe";
+  const finalRiskLevel = maxRisk(
+    actionRisk.level,
+    objectRisk.level,
+    contextRisk.level,
+    effectRisk.level,
+  );
+  const finalDecision = allowObserve ? "dia" : "ddeny";
+  const executionMode = allowObserve ? "ree-constrained" : "isolated";
+  const finalReason = allowObserve
+    ? "cross-boundary ordinary observation dispatch authorized locally"
+    : denyByObject
+      ? "remote protected or sensitive target is denied by local dispatch policy"
+      : denyByAction || denyByEffect
+        ? "cross-boundary remote state mutation or export is denied locally"
+        : "unclassified cross-boundary remote dispatch is denied locally";
+  const matchedRuleId = allowObserve
+    ? "remote.dispatch.local-allow.observe"
+    : denyByObject
+      ? "remote.dispatch.local-deny.protected-object"
+      : denyByAction || denyByEffect
+        ? "remote.dispatch.local-deny.cross-boundary-mutation"
+        : "remote.dispatch.local-deny.unclassified";
+  const normalizedRequest = normalizeRequestLevel(request, finalRiskLevel);
+  const constraints = allowObserve
+    ? {
+        remoteDispatch: {
+          dispatchKind: "remote",
+          boundary,
+          remotePlatform,
+          remoteExecutor,
+          targetLabel,
+          remoteObject,
+          allowedAction: remoteAction,
+          allowedEffect: effectClass,
+          objectClass,
+        },
+      }
+    : undefined;
+
+  return {
+    allow: allowObserve,
+    decision: finalDecision,
+    level: finalRiskLevel,
+    executionMode,
+    reason: finalReason,
+    matchedRuleId,
+    normalizedRequest,
+    constraints,
+    classification: {
+      actionRisk,
+      objectRisk,
+      contextRisk,
+      effectRisk,
+      contextFlags: {
+        destructive: effectClass === "destructive",
+        export: effectClass === "export" || effectClass === "archive",
+        multi_step: false,
+        outside_workspace: false,
+        protected_path: objectRisk.classification !== "ordinary",
+        remote_target: true,
+        shell_wrapper: false,
+        task_mismatch: false,
+        user_absent: Boolean(contextRisk.factors.user_absent),
+      },
+      effectFlags: {
+        destructive: effectClass === "destructive",
+        export: effectClass === "export" || effectClass === "archive",
+        multi_step: false,
+        outside_workspace: false,
+        protected_path: objectRisk.classification !== "ordinary",
+        remote_target: true,
+        shell_wrapper: false,
+        task_mismatch: false,
+        user_absent: Boolean(contextRisk.factors.user_absent),
+      },
+      finalRiskLevel,
+      decision: finalDecision,
+      reason: finalReason,
+      matchedRuleId,
+    },
+  };
+}
+
 export function evaluateTrustedAuthorizeRequest(request, policy) {
+  const structuredRemoteDispatch = evaluateStructuredRemoteDispatch(request);
+  if (structuredRemoteDispatch) {
+    return structuredRemoteDispatch;
+  }
   const actionRisk = classifyActionRisk(request, policy);
   const objectRisk = classifyObjectRisk(request, policy);
   const contextRisk = classifyContextRisk(request, policy, objectRisk);
